@@ -1,18 +1,25 @@
 import type { Metadata } from "next";
+import { Inter } from "next/font/google";
 import "./globals.css";
 
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-inter",
+  display: "swap",
+});
+
 export const metadata: Metadata = {
-  title: "Email Validator — Free CSV/XLSX Email Verification",
+  title: "MailCheck — Email Verification",
   description:
-    "Upload a CSV or Excel file and verify thousands of emails for free. Check syntax, disposable domains, MX records and SMTP mailbox existence.",
+    "Verify email addresses one at a time or in bulk — syntax, domain, MX and SMTP mailbox checks with clear, actionable results.",
 };
 
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en">
-      <body className="min-h-screen bg-slate-950 text-slate-100 antialiased">
+    <html lang="en" className={inter.variable}>
+      <body className="min-h-screen bg-slate-50 font-sans text-slate-900 antialiased">
         {children}
       </body>
     </html>

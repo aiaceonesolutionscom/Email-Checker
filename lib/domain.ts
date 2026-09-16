@@ -1,4 +1,7 @@
-﻿export type DomainStatus = "REAL" | "PARKED" | "FAKE" | "NEW" | "UNKNOWN";
+﻿import { dnsFetch } from "./dns-utils";
+import type { DnsAnswer } from "./dns-utils";
+
+export type DomainStatus = "REAL" | "PARKED" | "FAKE" | "NEW" | "UNKNOWN";
 
 export interface DomainResult {
   domain: string;
@@ -9,36 +12,26 @@ export interface DomainResult {
   hasSsl: boolean;
   ageDays: number | null;
   reason: string;
+  hasNullMx: boolean;
+  mxHost: string | null;
 }
 
-interface DnsAnswer {
-  name: string;
-  type: number;
-  TTL: number;
-  data: string;
-}
-
-async function dnsFetch(name: string, type: string): Promise<DnsAnswer[]> {
-  const providers = [
-    `https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${type}`,
-    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`,
-  ];
-  for (const url of providers) {
-    try {
-      const res = await fetch(url, {
-        headers: { Accept: "application/dns-json" },
-        signal: AbortSignal.timeout(6000),
-      });
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (data && data.Answer && Array.isArray(data.Answer)) {
-        return data.Answer.filter((a: any) => typeof a.data === "string");
-      }
-    } catch {
-      continue;
-    }
-  }
-  return [];
+function readMxRecords(mxRecords: DnsAnswer[]) {
+  const parsed = mxRecords
+    .filter((r) => r.type === 15 && r.data && r.data.trim() !== "")
+    .map((r) => {
+      const match = r.data.trim().match(/^(\d+)\s+(.+)$/);
+      const prio = match ? parseInt(match[1], 10) : 0;
+      const exchange = match
+        ? match[2].trim().replace(/\.$/, "") || "."
+        : ".";
+      return { prio, exchange };
+    })
+    .sort((a, b) => a.prio - b.prio);
+  const hasMx = parsed.some((r) => r.exchange !== ".");
+  const hasNullMx = parsed.length > 0 && !hasMx;
+  const primary = parsed.find((r) => r.exchange !== ".")?.exchange ?? null;
+  return { hasMx, hasNullMx, mxHost: primary };
 }
 
 function parseSoa(serial: string): number | null {
@@ -65,57 +58,86 @@ function parseSoa(serial: string): number | null {
   return age >= 0 ? age : null;
 }
 
-async function checkSsl(domain: string): Promise<boolean> {
-  try {
-    const res = await fetch(`https://${domain}`, {
-      method: "HEAD",
-      signal: AbortSignal.timeout(5000),
+const PARKING_NS_MARKERS = [
+  "afternic",
+  "sedo",
+  "bodis",
+  "dan.com",
+  "parkingcrew",
+  "parklogic",
+  "rookdns",
+  "netfirms",
+  "justhost",
+];
+
+const PARKING_URL_PATTERN = /(lander|parker|parking|forsale|for-sale|make-an-offer|makeanoffer|buydomains|afternic|sedo|bodis)/i;
+
+const PARKING_TEXT_PATTERN = /(is for sale|domain parking|buy this domain|make offer|domain is parked|\/lander|\/parker|\/parking)/i;
+
+function detectParkingNs(nsRecords: DnsAnswer[]): boolean {
+  return nsRecords.some((r) =>
+    PARKING_NS_MARKERS.some((m) => String(r.data).toLowerCase().includes(m))
+  );
+}
+
+async function inspectWeb(domain: string): Promise<{ ssl: boolean; parked: boolean }> {
+  const run = async (host: string) => {
+    const res = await fetch(`https://${host}`, {
       redirect: "follow",
+      signal: AbortSignal.timeout(5000),
     });
-    return res.ok || res.status < 500;
+    const ssl = res.ok || res.status < 500;
+    let parked = false;
+    try {
+      if (PARKING_URL_PATTERN.test(res.url || "")) parked = true;
+      if (!parked) {
+        const text = await res.text();
+        parked = PARKING_TEXT_PATTERN.test(text.slice(0, 4096));
+      }
+    } catch { /* body read failed */ }
+    return { ssl, parked };
+  };
+  try {
+    return await run(domain);
   } catch {
     try {
-      const res = await fetch(`https://www.${domain}`, {
-        method: "HEAD",
-        signal: AbortSignal.timeout(5000),
-        redirect: "follow",
-      });
-      return res.ok || res.status < 500;
+      return await run(`www.${domain}`);
     } catch {
-      return false;
+      return { ssl: false, parked: false };
     }
   }
 }
 
 export async function verifyDomain(domain: string): Promise<DomainResult> {
   try {
-    const [nsRecords, mxRecords, aRecords, soaRecords] = await Promise.all([
+    const [ns, mx, a, aaaa, soa] = await Promise.all([
       dnsFetch(domain, "NS"),
       dnsFetch(domain, "MX"),
       dnsFetch(domain, "A"),
+      dnsFetch(domain, "AAAA"),
       dnsFetch(domain, "SOA"),
     ]);
 
+    const nsRecords = ns.answers;
+    const mxRecords = mx.answers;
+    const aRecords = a.answers;
+    const soaRecords = soa.answers;
+
     const hasNs = nsRecords.length > 0;
-    const hasMx = mxRecords.some(
-      (r) => r.type === 15 && r.data && r.data.trim() !== "."
-    );
-    const hasA = aRecords.some((r) => r.type === 1);
+    const { hasMx, hasNullMx, mxHost } = readMxRecords(mxRecords);
+    const hasA =
+      aRecords.some((r) => r.type === 1) ||
+      aaaa.answers.some((r) => r.type === 28);
 
     let ageDays: number | null = null;
     if (soaRecords.length > 0) {
-      const soa = soaRecords.find((r) => r.type === 6);
-      if (soa) {
-        const parts = soa.data.split(" ");
+      const soaRec = soaRecords.find((r) => r.type === 6);
+      if (soaRec) {
+        const parts = soaRec.data.split(" ");
         if (parts.length >= 3) {
           ageDays = parseSoa(parts[2]);
         }
       }
-    }
-
-    let hasSsl = false;
-    if (hasA || hasMx) {
-      hasSsl = await checkSsl(domain);
     }
 
     if (!hasNs) {
@@ -128,19 +150,36 @@ export async function verifyDomain(domain: string): Promise<DomainResult> {
         hasSsl: false,
         ageDays: null,
         reason: "Domain not registered (no NS records)",
+        hasNullMx: false,
+        mxHost: null,
       };
     }
 
-    if (!hasMx && !hasA) {
+    let hasSsl = false;
+    let parkingHttp = false;
+    if (hasA || hasMx) {
+      const inspected = await inspectWeb(domain);
+      hasSsl = inspected.ssl;
+      if (!hasMx) parkingHttp = inspected.parked;
+    }
+
+    const parkingNs = detectParkingNs(nsRecords);
+
+    if (!hasMx && (!hasA || parkingNs || parkingHttp)) {
+      const reason = parkingNs || parkingHttp
+        ? "Domain registered but appears parked (no mail service)"
+        : "Domain registered but no mail or web server";
       return {
         domain,
         status: "PARKED",
         hasNs: true,
         hasMx: false,
-        hasA: false,
+        hasA,
         hasSsl,
         ageDays,
-        reason: "Domain registered but no mail or web server",
+        reason,
+        hasNullMx,
+        mxHost: null,
       };
     }
 
@@ -153,6 +192,8 @@ export async function verifyDomain(domain: string): Promise<DomainResult> {
       hasSsl,
       ageDays,
       reason: "Domain verified - active",
+      hasNullMx,
+      mxHost,
     };
   } catch {
     return {
@@ -164,6 +205,8 @@ export async function verifyDomain(domain: string): Promise<DomainResult> {
       hasSsl: false,
       ageDays: null,
       reason: "DNS lookup failed",
+      hasNullMx: false,
+      mxHost: null,
     };
   }
 }

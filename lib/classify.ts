@@ -9,6 +9,7 @@ export interface ClassifyInput {
   mx: boolean;
   smtp: VerifyStatus;
   providerBlocked?: boolean;
+  hasNullMx?: boolean;
 }
 
 export interface ClassifyOutput {
@@ -43,7 +44,31 @@ export function classifyFinal(
     return { status: "INVALID", reason: "Disposable email address", confidence: 3, verdict: "Not Verified", tag };
   }
   if (!input.mx) {
-    return { status: "INVALID", reason: "No MX record found for domain", confidence: 5, verdict: "Not Verified", tag };
+    if (input.hasNullMx) {
+      return {
+        status: "INVALID",
+        reason: "Domain explicitly rejects email (null MX record)",
+        confidence: 2,
+        verdict: "Not Verified",
+        tag,
+      };
+    }
+    if (input.domainStatus === "REAL") {
+      return {
+        status: "UNKNOWN",
+        reason: "MX record response inconsistent - domain was verified active",
+        confidence: 40,
+        verdict: "Uncertain",
+        tag,
+      };
+    }
+    return {
+      status: "INVALID",
+      reason: "No MX record found for domain",
+      confidence: 5,
+      verdict: "Not Verified",
+      tag,
+    };
   }
   if (input.providerBlocked) {
     return { status: "UNKNOWN", reason: "Provider blocks SMTP verification - mailbox cannot be confirmed", confidence: 45, verdict: "Uncertain", tag };

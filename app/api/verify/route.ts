@@ -41,6 +41,7 @@ function makeResult(input: {
   mx: boolean | null;
   smtp: VerifyStatus;
   providerBlocked?: boolean;
+  hasNullMx?: boolean;
   domainStatus?: null;
 }): VerifyResult {
   const { status, reason, confidence, verdict, tag } = classifyFinal(
@@ -52,6 +53,7 @@ function makeResult(input: {
       mx: input.mx ?? false,
       smtp: input.smtp,
       providerBlocked: input.providerBlocked,
+      hasNullMx: input.hasNullMx,
     },
     input.email.split("@")[1]
   );
@@ -111,8 +113,8 @@ async function processEmail(input: {
   if (nullMx) {
     return makeResult({
       id, email, originalRow,
-      syntax: true, disposable, role, mx: true,
-      smtp: "N/A",
+      syntax: true, disposable, role, mx: false,
+      smtp: "N/A", hasNullMx: true,
     });
   }
 
@@ -178,12 +180,18 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "No emails provided" }, { status: 400 });
   }
 
-  const emails = body.emails.map((e: any, i: number) => ({
-    id: e.id ?? i,
-    email: String(e.email).trim().toLowerCase(),
-    mxHost: typeof e.mxHost === "string" ? e.mxHost : null,
-    originalRow: (e as any).originalRow as Record<string, string> ?? {},
-  }));
+  const emails = body.emails.map((e: any, i: number) => {
+    const isObj = typeof e === "object" && e !== null;
+    const raw = isObj ? e.email : e;
+    return {
+      id: isObj ? (e.id ?? i) : i,
+      email: String(raw ?? "").trim().toLowerCase(),
+      mxHost: isObj && typeof e.mxHost === "string" ? e.mxHost : null,
+      originalRow: isObj && typeof e.originalRow === "object" && e.originalRow !== null
+        ? (e.originalRow as Record<string, string>)
+        : {},
+    };
+  });
 
   const results = await mapWithConcurrency(emails, CONCURRENCY, processEmail);
 
